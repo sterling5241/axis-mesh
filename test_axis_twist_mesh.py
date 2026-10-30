@@ -1241,9 +1241,14 @@ def test_with_real_mesh_based_axis_twist_compensation(tmp_path):
     connect(printer)
     plist = printer.objects["probe_list"].probes
     lc, carto = plist["load_cell_probe"], plist["carto"]
-    # patched in place, real manager still answers for its own maps
-    assert manager.get_z_compensation_value.__self__ is atm
     atm.cmd_CALIBRATE(FakeGcmd())
+    # Kalico holds the map and corrects the probe itself: nothing wrapped
+    assert manager.get_z_compensation_value.__self__ is manager
+    assert manager.maps["carto"].mesh is act(atm)["mesh"]
+    g = FakeGcmd()
+    atm.cmd_CHECK(g)
+    assert "not needed (Kalico applies the maps itself)" in g.out[0]
+    assert "MISMATCH" not in g.out[0] and "reaches" in g.out[0]
     off = atm.report["mean_offset"]
     # Readings the way the new PrinterProbe._probe makes them
     for x, y in ((20.0, 20.0), (110.0, 110.0), (200.0, 200.0)):
@@ -1912,7 +1917,7 @@ def test_saved_map_is_kalicos_own_and_never_doubled(tmp_path):
         assert abs(got - v) < 1e-5
     # with the add-on hooked in: the same value, not twice
     connect(printer2)
-    assert manager.get_z_compensation_value.__self__ is atm2
+    assert manager.get_z_compensation_value.__self__ is manager
     for (bx, by), v in want.items():
         got = manager.get_z_compensation_value([bx, by - 15.0, 0.0], carto2)
         assert abs(got - v) < 1e-5
@@ -1994,3 +1999,78 @@ def test_kalico_call_path_detected():
     # the real Kalico probe code (whichever version KALICO points at) still
     # asks axis_twist_compensation for each reading
     assert axis_twist_mesh.AxisTwistMesh._kalico_call_path(None) is True
+
+
+
+@pytest.mark.skipif(not NEW_ATC, reason="Kalico without mesh-based twist comp")
+def test_mesh_kalico_clear_calibrate_and_wrap_only_when_needed(tmp_path):
+    cfg = CFG.replace("correction_probe: carto",
+                      "correction_probe: carto, eddy")
+    printer, atm = make(tmp_path, cfg + "\n[axis_twist_compensation]\n",
+                        carto_err=nonadditive)
+    fc = configparser.RawConfigParser()
+    fc.read_string(cfg + "\n[axis_twist_compensation]\n")
+    manager = katc.load_config(configfile.ConfigWrapper(
+        printer, fc, {}, "axis_twist_compensation"))
+    printer.objects["axis_twist_compensation"] = manager
+    plist = printer.objects["probe_list"].probes
+    plist["eddy"] = SimProbe(printer, "eddy", (-20.0, 10.0, 1.5), eddy_err)
+    connect(printer)
+    carto, lc = plist["carto"], plist["load_cell_probe"]
+    atm.cmd_CALIBRATE(FakeGcmd())
+    first = atm.report["comp_grid"]
+    # recalibrating with Kalico's map active still measures raw
+    atm.cmd_CALIBRATE(FakeGcmd())
+    assert atm.report["comp_grid"] == first
+    pos = [93.0, 61.0 - 15.0, 0.0]
+    want = atm.compensation_at(93.0, 61.0)
+    assert abs(manager.get_z_compensation_value(pos, carto) - want) < 1e-9
+    assert manager.get_z_compensation_value(pos, lc) == 0.0
+    # CLEAR takes it out of Kalico too; LOAD puts it back
+    atm.cmd_CLEAR(FakeGcmd({"PROBE": "carto"}))
+    assert manager.get_z_compensation_value(pos, carto) == 0.0
+    atm.cmd_PROFILE(FakeGcmd({"LOAD": "carto"}))
+    assert abs(manager.get_z_compensation_value(pos, carto) - want) < 1e-9
+    assert manager.get_z_compensation_value.__self__ is manager
+    # a failed calibration leaves Kalico's map as it was
+    k = {"n": 0}
+    orig = carto._read
+
+    def never():
+        k["n"] += 1
+        z = orig()
+        z[2] += 0.05 * k["n"]
+        return z
+    carto._read = never
+    with pytest.raises(CmdError):
+        atm.cmd_CALIBRATE(FakeGcmd())
+    carto._read = orig
+    assert abs(manager.get_z_compensation_value(pos, carto) - want) < 1e-9
+
+
+@pytest.mark.skipif(not NEW_ATC, reason="Kalico without mesh-based twist comp")
+def test_mesh_kalico_wraps_for_plugin_that_is_not_default(tmp_path):
+    cfg = CARTO_CFG + "\n[axis_twist_compensation]\n"
+    printer, atm = make(tmp_path, cfg)
+    fc = configparser.RawConfigParser()
+    fc.read_string(cfg)
+    manager = katc.load_config(configfile.ConfigWrapper(
+        printer, fc, {}, "axis_twist_compensation"))
+    printer.objects["axis_twist_compensation"] = manager
+    plist = printer.objects["probe_list"]
+    del plist.probes["carto"]
+    carto = CartoPluginProbe(printer, (0.0, 15.0, 2.0), nonadditive)
+    carto.get_offsets = lambda *a: (0.0, 15.0, 2.0)
+    plist.probes["cartographer"] = carto
+    printer.carto_has_atc_section = True
+    plist.default_probe = ("load_cell_probe", plist.probes["load_cell_probe"])
+    connect(printer)
+    atm.cmd_CALIBRATE(FakeGcmd())
+    # Cartographer doesn't say which probe it is and isn't the default:
+    # only then is the function wrapped
+    assert manager.get_z_compensation_value.__self__ is atm
+    off = atm.report["mean_offset"]
+    lc = plist.probes["load_cell_probe"]
+    for x, y in ((50.0, 65.0), (140.0, 110.0)):
+        assert abs(probe_at(printer, carto, x, y) - probe_at(printer, lc, x, y)
+                   - off) < 1e-9
