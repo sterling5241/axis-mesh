@@ -396,6 +396,8 @@ class AxisTwistMesh:
         self.report = None          # analysis of self.last
         self.calibrating = False
         self._manual = None         # state of a running manual calibration
+        self._kalico_handles = set()   # probes Kalico corrects by itself
+        self._suspended = None
 
         self.printer.register_event_handler(
             "klippy:connect", self._handle_connect)
@@ -721,7 +723,6 @@ class AxisTwistMesh:
         if problem:
             raise error(problem)
         mesh = self._build_mesh(probe_name, prof, error)
-        self._install_hook()
         active = dict(self.active)
         active[probe_name] = {
             "name": prof.get("section", probe_name),
@@ -732,6 +733,7 @@ class AxisTwistMesh:
             "mesh": mesh,
         }
         self.active = active
+        self._update_integration()
 
     # ------------------------------------------------------------------
     # Probe access
@@ -815,7 +817,6 @@ class AxisTwistMesh:
         return sorted(plist.get_all().keys())
 
     def _handle_connect(self):
-        self._install_hook()
         if self._auto_correction:
             name = self._kalico_default_probe()
             if name is None or name == self.reference_probe:
@@ -841,6 +842,7 @@ class AxisTwistMesh:
             except ValueError as exc:
                 logging.warning("axis_twist_mesh: map for '%s' not loaded: "
                                 "%s", probe_name, exc)
+        self._update_integration()
         if self._touch_ref and self._single_modes() is None:
             logging.warning(
                 "axis_twist_mesh: reference: touch needs the Cartographer or "
@@ -1041,6 +1043,89 @@ class AxisTwistMesh:
             atc.get_z_compensation_value = self.get_z_compensation_value
         self._hook_installed = True
 
+    def _hook_active(self):
+        atc = self.printer.lookup_object("axis_twist_compensation", None)
+        return atc is self or (atc is not None and getattr(
+            atc.get_z_compensation_value, "__self__", None) is self)
+
+    def _kalico_manager(self):
+        """Mesh-based Kalico's axis_twist_compensation (per-probe maps), or
+        None on older Kalico / when there is none."""
+        owner = self._native_owner()
+        if owner is None:
+            owner = self.printer.lookup_object("axis_twist_compensation",
+                                               None)
+        if owner is None or owner is self or \
+                getattr(owner, "get_compensation", None) is None or \
+                not hasattr(owner, "maps"):
+            return None
+        return owner
+
+    def _kalico_comp(self, probe_name, create=False):
+        """Kalico's map holder for a probe in its probe list, or None."""
+        manager = self._kalico_manager()
+        plist = self.printer.lookup_object("probe_list", None)
+        probe = plist.get_probe(probe_name) if plist is not None else None
+        if manager is None or probe is None:
+            return None
+        comp = manager.get_compensation(probe)
+        if comp is None and create and \
+                hasattr(manager, "_create_compensation"):
+            try:
+                comp = manager._create_compensation(probe)
+            except Exception:
+                logging.exception("axis_twist_mesh: can't give Kalico a map "
+                                  "holder for '%s'", probe_name)
+                comp = None
+        return comp if hasattr(comp, "mesh") else None
+
+    def _update_integration(self):
+        """Give mesh-based Kalico the active maps so it corrects those
+        probes itself, and wrap its function only for readings it can't
+        attribute (Beacon; Cartographer when it isn't the default probe;
+        everything on older Kalico)."""
+        handled = set()
+        for name in self.correction_probes:
+            entry = self.active.get(name)
+            comp = self._kalico_comp(name, create=entry is not None)
+            if comp is None:
+                continue
+            comp.mesh = entry["mesh"] if entry is not None else None
+            if entry is not None:
+                handled.add(name)
+        self._kalico_handles = handled
+        if self._needs_wrap():
+            self._install_hook()
+
+    def _needs_wrap(self):
+        if not self.active:
+            return False
+        if self._kalico_manager() is None:
+            return True
+        default = self._kalico_default_probe()
+        for name in self.active:
+            corr = self._resolve_probe(name)
+            if name not in self._kalico_handles or self._is_beacon(corr):
+                return True
+            if self._is_cartographer_plugin(corr) and name != default:
+                return True     # it doesn't say which probe is reading
+        return False
+
+    def _suspend_kalico_map(self, probe_name):
+        """Raw readings while calibrating: take Kalico's map for this probe
+        out until the calibration ends (restored if it fails)."""
+        comp = self._kalico_comp(probe_name)
+        if comp is None or comp.mesh is None:
+            return None
+        saved, comp.mesh = comp.mesh, None
+        return comp, saved
+
+    def _resume_kalico_map(self, suspended):
+        if suspended is not None:
+            comp, saved = suspended
+            if comp.mesh is None:
+                comp.mesh = saved
+
     @staticmethod
     def _probe_active(probe):
         return probe is not None and \
@@ -1159,6 +1244,12 @@ class AxisTwistMesh:
         name = self._identify_reading(probe) if self.active else None
         if name is None or name not in self.active:
             # not a correction probe's reading: Kalico's own value
+            return self._native_value(pos, probe)
+        if name in self._kalico_handles and (
+                probe is not None or
+                name == self._kalico_default_probe() and
+                not self._is_beacon(self._resolve_probe(name))):
+            # Kalico has this map and knows the probe: its own value
             return self._native_value(pos, probe)
         # A correction probe's map is stored where Kalico keeps its own
         # (same data), so it replaces Kalico's value rather than adding.
@@ -1406,7 +1497,8 @@ class AxisTwistMesh:
             self._check_reachable(gcmd, toolhead, "nozzle", _Nozzle())
             manual_probe.verify_no_manual_probe(self.printer)
 
-        self._install_hook()
+        if self._kalico_manager() is None:
+            self._install_hook()        # older Kalico: raw via the hook
         job = {"which": which, "reference": reference,
                "probe": probe_name, "grid": grid,
                "xs": self._grid_axis(0), "ys": self._grid_axis(1)}
@@ -1414,10 +1506,12 @@ class AxisTwistMesh:
             self._start_manual(gcmd, toolhead, probes[0][1], job)
             return
         self.calibrating = True
+        suspended = self._suspend_kalico_map(probe_name)
         try:
             results = self._probe_grid(gcmd, toolhead, probes)
         finally:
             self.calibrating = False
+            self._resume_kalico_map(suspended)
         self._finish_calibration(
             gcmd, job, {role: h for role, (h, _) in results.items()})
 
@@ -1474,6 +1568,7 @@ class AxisTwistMesh:
             "tap_gcmd": self._tap_gcmd(gcmd),
         }
         self.calibrating = True
+        self._suspended = self._suspend_kalico_map(job["probe"])
         gcmd.respond_info(
             "axis_twist_mesh: manual calibration, %d points. At each point "
             "'%s' measures first, then lower the nozzle onto the paper with "
@@ -1487,6 +1582,8 @@ class AxisTwistMesh:
             if m["index"] >= len(m["nodes"]):
                 self._manual = None
                 self.calibrating = False
+                self._resume_kalico_map(self._suspended)
+                self._suspended = None
                 # nozzle is still on the paper: lift before anything moves
                 m["toolhead"].manual_move(
                     [None, None, self.horizontal_move_z], self.lift_speed)
@@ -1548,6 +1645,8 @@ class AxisTwistMesh:
         if self._manual is not None:
             self._manual = None
             self.calibrating = False
+            self._resume_kalico_map(self._suspended)
+            self._suspended = None
 
     # ------------------------------------------------------------------
     # Kalico's own axis_twist_compensation (line-based or mesh-based)
@@ -1558,8 +1657,10 @@ class AxisTwistMesh:
     def _legacy_lines(self):
         """Older Kalico's [axis_twist_compensation] with z_compensations /
         zy_compensations set, or None."""
-        owner = self._native_owner()
-        if owner is None or getattr(owner, "get_compensation", None):
+        owner = self._native_owner() or self.printer.lookup_object(
+            "axis_twist_compensation", None)
+        if owner is None or owner is self or \
+                getattr(owner, "get_compensation", None):
             return None
         if getattr(owner, "z_compensations", None) or \
                 getattr(owner, "zy_compensations", None):
@@ -1659,6 +1760,7 @@ class AxisTwistMesh:
                 self.maps = {p: m for p, m in self.maps.items() if p != name}
                 self.active = {p: e for p, e in self.active.items()
                                if p != name}
+                self._update_integration()
             elif name in self.old_profiles:
                 section = "%s %s" % (self.name, name)
                 configfile.remove_section(section)
@@ -1675,11 +1777,13 @@ class AxisTwistMesh:
     def cmd_CLEAR(self, gcmd):
         if gcmd.get("PROBE", None) is None:
             self.active = {}
+            self._update_integration()
             gcmd.respond_info("axis_twist_mesh: compensation off")
             return
         probe_name = self._parse_probe_param(gcmd)
         self.active = {p: e for p, e in self.active.items()
                        if p != probe_name}
+        self._update_integration()
         gcmd.respond_info("axis_twist_mesh: compensation off for '%s'"
                           % probe_name)
 
@@ -1846,10 +1950,16 @@ class AxisTwistMesh:
     def _run_check(self):
         lines = ["Axis Twist Mesh check:"]
         atc = self.printer.lookup_object("axis_twist_compensation", None)
-        hooked = atc is self or (atc is not None and getattr(
-            atc.get_z_compensation_value, "__self__", None) is self)
+        wrapped = self._hook_active()
+        needed = self._needs_wrap()
+        hooked = wrapped or (atc is not None and not needed)
         lines.append("  hook on axis_twist_compensation: %s" % (
-            "installed" if hooked else "MISSING"))
+            "installed" if wrapped else
+            "not needed (Kalico applies the maps itself)" if hooked else
+            "MISSING"))
+        if self._kalico_handles:
+            lines.append("  Kalico applies: %s" % ", ".join(
+                sorted(self._kalico_handles)))
         ok = hooked and bool(self.active)
         if not self.active:
             lines.append("  no active map - run AXIS_TWIST_MESH_PROFILE "
@@ -1935,9 +2045,7 @@ class AxisTwistMesh:
         return ok, lines
 
     def _native_takes_probe(self):
-        owner = self._native_owner()
-        return owner is not None and \
-            getattr(owner, "get_compensation", None) is not None
+        return self._kalico_manager() is not None
 
     def _as_kalico_reading(self, atc, corr, pos):
         """Older Kalico: a probe's reading is identified by its pending
